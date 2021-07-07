@@ -11,7 +11,7 @@ class SimSiam(nn.Module):
     """
     Build a SimSiam model.
     """
-    def __init__(self, base_encoder, dim=2048, pred_dim=512):
+    def __init__(self, base_encoder, dim=2048, pred_dim=512, dataset='imagenet'):
         """
         dim: feature dimension (default: 2048)
         pred_dim: hidden dimension of the predictor (default: 512)
@@ -24,9 +24,9 @@ class SimSiam(nn.Module):
 
         # build a 3-layer projector
         prev_dim = self.encoder.fc.weight.shape[1]
-        self.encoder.fc = nn.Sequential(nn.Linear(prev_dim, prev_dim, bias=False),
-                                        nn.BatchNorm1d(prev_dim),
-                                        nn.ReLU(inplace=True),  # first layer
+        self.encoder.fc = nn.Sequential(nn.Linear(prev_dim, prev_dim, bias=False) if dataset == 'imagenet' else nn.Identity(),
+                                        nn.BatchNorm1d(prev_dim) if dataset == 'imagenet' else nn.Identity(),
+                                        nn.ReLU(inplace=True) if dataset == 'imagenet' else nn.Identity(),  # first layer
                                         nn.Linear(prev_dim, prev_dim, bias=False),
                                         nn.BatchNorm1d(prev_dim),
                                         nn.ReLU(inplace=True),  # second layer

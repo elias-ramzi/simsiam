@@ -7,10 +7,8 @@
 
 import argparse
 import builtins
-import math
 import os
 import random
-import shutil
 import time
 import warnings
 
@@ -26,9 +24,11 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+import numpy as np
 
 import simsiam.loader
 import simsiam.builder
+import simsiam.utils as lib
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
@@ -64,11 +64,13 @@ parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
-parser.add_argument('--world-size', default=-1, type=int,
+# CHANGED: default world-size to 1
+parser.add_argument('--world-size', default=1, type=int,
                     help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int,
                     help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+# CHANGED: default dist-url to None
+parser.add_argument('--dist-url', default='tcp://localhost:10001', type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
@@ -91,12 +93,18 @@ parser.add_argument('--fix-pred-lr', action='store_true',
                     help='Fix learning rate for the predictor')
 
 
+parser.add_argument('--dataset', default='imagenet', type=str)
+parser.add_argument('--log-dir', default='', type=str)
+
+
 def main():
     args = parser.parse_args()
 
     if args.seed is not None:
         random.seed(args.seed)
+        np.random.seed(args.seed)
         torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
         cudnn.deterministic = True
         warnings.warn('You have chosen to seed training. '
                       'This will turn on the CUDNN deterministic setting, '
@@ -152,7 +160,7 @@ def main_worker(gpu, ngpus_per_node, args):
     print("=> creating model '{}'".format(args.arch))
     model = simsiam.builder.SimSiam(
         models.__dict__[args.arch],
-        args.dim, args.pred_dim)
+        args.dim, args.pred_dim, args.dataset)
 
     # infer learning rate before changing batch size
     init_lr = args.lr * args.batch_size / 256
@@ -216,32 +224,46 @@ def main_worker(gpu, ngpus_per_node, args):
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
+            random.setstate(checkpoint["RANDOM_STATE"])
+            np.random.set_state(checkpoint["NP_STATE"])
+            torch.random.set_rng_state(checkpoint["TORCH_STATE"])
+            torch.cuda.set_rng_state_all(checkpoint["TORCH_CUDA_STATE"])
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+    if args.dataset == 'imagenet':
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+    else:
+        normalize = transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
 
     # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
     augmentation = [
-        transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
+        transforms.RandomResizedCrop(224, scale=(0.2, 1.)) if args.dataset == 'imagenet' else transforms.RandomCrop(32, padding=4),
         transforms.RandomApply([
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
         ], p=0.8),
         transforms.RandomGrayscale(p=0.2),
-        transforms.RandomApply([simsiam.loader.GaussianBlur([.1, 2.])], p=0.5),
+        transforms.RandomApply([simsiam.loader.GaussianBlur([.1, 2.])], p=0.5) if args.dataset == 'imagenet' else simsiam.loader.Identity(),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        normalize
+        normalize,
     ]
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        simsiam.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+    if args.dataset == 'imagenet':
+        traindir = os.path.join(args.data, 'train')
+        train_dataset = datasets.ImageFolder(
+            traindir,
+            simsiam.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+    elif args.dataset == 'cifar10':
+        train_dataset = datasets.CIFAR10(args.data, train=True, transform=simsiam.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+    elif args.dataset == 'cifar100':
+        train_dataset = datasets.CIFAR100(args.data, train=True, transform=simsiam.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+    else:
+        raise ValueError(f"Unknown dataset : {args.dataset}")
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -255,26 +277,30 @@ def main_worker(gpu, ngpus_per_node, args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, init_lr, epoch, args)
+        lib.adjust_learning_rate(optimizer, init_lr, epoch, args)
 
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, args)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                     and args.rank % ngpus_per_node == 0):
-            save_checkpoint({
+            lib.save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-            }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(epoch))
+                "RANDOM_STATE":  random.getstate(),
+                "NP_STATE":  np.random.get_state(),
+                "TORCH_STATE":  torch.random.get_rng_state(),
+                "TORCH_CUDA_STATE":  torch.cuda.get_rng_state_all(),
+            }, is_best=False, filename=os.path.join(args.log_dir, 'checkpoint_{:04d}.pth.tar'.format(epoch)))
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
-    batch_time = AverageMeter('Time', ':6.3f')
-    data_time = AverageMeter('Data', ':6.3f')
-    losses = AverageMeter('Loss', ':.4f')
-    progress = ProgressMeter(
+    batch_time = lib.AverageMeter('Time', ':6.3f')
+    data_time = lib.AverageMeter('Data', ':6.3f')
+    losses = lib.AverageMeter('Loss', ':.4f')
+    progress = lib.ProgressMeter(
         len(train_loader),
         [batch_time, data_time, losses],
         prefix="Epoch: [{}]".format(epoch))
@@ -308,63 +334,6 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
-
-
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    torch.save(state, filename)
-    if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
-
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self, name, fmt=':f'):
-        self.name = name
-        self.fmt = fmt
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-    def __str__(self):
-        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
-        return fmtstr.format(**self.__dict__)
-
-
-class ProgressMeter(object):
-    def __init__(self, num_batches, meters, prefix=""):
-        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
-        self.meters = meters
-        self.prefix = prefix
-
-    def display(self, batch):
-        entries = [self.prefix + self.batch_fmtstr.format(batch)]
-        entries += [str(meter) for meter in self.meters]
-        print('\t'.join(entries))
-
-    def _get_batch_fmtstr(self, num_batches):
-        num_digits = len(str(num_batches // 1))
-        fmt = '{:' + str(num_digits) + 'd}'
-        return '[' + fmt + '/' + fmt.format(num_batches) + ']'
-
-
-def adjust_learning_rate(optimizer, init_lr, epoch, args):
-    """Decay the learning rate based on schedule"""
-    cur_lr = init_lr * 0.5 * (1. + math.cos(math.pi * epoch / args.epochs))
-    for param_group in optimizer.param_groups:
-        if 'fix_lr' in param_group and param_group['fix_lr']:
-            param_group['lr'] = init_lr
-        else:
-            param_group['lr'] = cur_lr
 
 
 if __name__ == '__main__':
