@@ -1,0 +1,21 @@
+# @package _group_
+- name: SGD
+  params: encoder
+  kwargs:
+    lr: 0.03
+    weight_decay: 0.0005
+  scheduler_on_epoch:
+    name: CosineAnnealingLR
+    kwargs:
+      T_max: ${experience.epochs}
+  scheduler_on_step:
+  scheduler_on_val:
+
+- name: SGD
+  params: predictor
+  kwargs:
+    lr: 0.03
+    weight_decay: 0.0005
+  scheduler_on_epoch:
+  scheduler_on_step:
+  scheduler_on_val:

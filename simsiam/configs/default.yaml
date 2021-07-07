@@ -1,0 +1,15 @@
+defaults:
+
+    - experience: imagenet
+
+    - dataset: imagenet
+
+    - augmentations: imagenet
+
+    - models: resnet50
+
+    - optimizer: imagenet
+
+    - hydra/job_logging: colorlog
+
+    - hydra/hydra_logging: colorlog

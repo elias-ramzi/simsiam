@@ -1,0 +1,4 @@
+# @package _group_
+name: ImageFolder
+kwargs:
+  root: /local/DEEPLEARNING/image_retrieval/imagenet/ILSVRC/Data/CLS-LOC/train

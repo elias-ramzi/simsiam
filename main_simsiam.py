@@ -252,6 +252,7 @@ def main_worker(gpu, ngpus_per_node, args):
         transforms.ToTensor(),
         normalize,
     ]
+    print(augmentation)
 
     if args.dataset == 'imagenet':
         traindir = os.path.join(args.data, 'train')
