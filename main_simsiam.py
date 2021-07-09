@@ -69,7 +69,7 @@ parser.add_argument('--world-size', default=1, type=int,
                     help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int,
                     help='node rank for distributed training')
-# CHANGED: default dist-url to None
+# CHANGED: default dist-url to the following
 parser.add_argument('--dist-url', default='tcp://localhost:10001', type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
@@ -95,6 +95,8 @@ parser.add_argument('--fix-pred-lr', action='store_true',
 
 parser.add_argument('--dataset', default='imagenet', type=str)
 parser.add_argument('--log-dir', default='', type=str)
+parser.add_argument('--save-freq', default=1, type=int)
+parser.add_argument('--amp', default=False, action='store_true')
 
 
 def main():
@@ -193,7 +195,11 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         # AllGather implementation (batch shuffle, queue update, etc.) in
         # this code only supports DistributedDataParallel.
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
+        if torch.cuda.device_count() > 1:
+            print("using DataParallel")
+            model = torch.nn.DataParallel(model)
+        model.cuda()
+        # raise NotImplementedError("Only DistributedDataParallel is supported.")
     print(model)  # print model after SyncBatchNorm
 
     # define loss function (criterion) and optimizer
@@ -242,7 +248,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
     augmentation = [
-        transforms.RandomResizedCrop(224, scale=(0.2, 1.)) if args.dataset == 'imagenet' else transforms.RandomCrop(32, padding=4),
+        transforms.RandomResizedCrop(224, scale=(0.2, 1.)) if args.dataset == 'imagenet' else transforms.RandomResizedCrop(32, scale=(0.2, 1.)),
         transforms.RandomApply([
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
         ], p=0.8),
@@ -275,29 +281,34 @@ def main_worker(gpu, ngpus_per_node, args):
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
+    scaler = None
+    if args.amp:
+        scaler = torch.cuda.amp.GradScaler()
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
         lib.adjust_learning_rate(optimizer, init_lr, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, epoch, args, scaler)
 
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                                                    and args.rank % ngpus_per_node == 0):
-            lib.save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                "RANDOM_STATE":  random.getstate(),
-                "NP_STATE":  np.random.get_state(),
-                "TORCH_STATE":  torch.random.get_rng_state(),
-                "TORCH_CUDA_STATE":  torch.cuda.get_rng_state_all(),
-            }, is_best=False, filename=os.path.join(args.log_dir, 'checkpoint_{:04d}.pth.tar'.format(epoch)))
+        if (epoch % args.save_freq == 0) or (epoch+1 == args.epochs):
+            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                                                        and args.rank % ngpus_per_node == 0):
+                lib.save_checkpoint({
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    "RANDOM_STATE":  random.getstate(),
+                    "NP_STATE":  np.random.get_state(),
+                    "TORCH_STATE":  torch.random.get_rng_state(),
+                    "TORCH_CUDA_STATE":  torch.cuda.get_rng_state_all(),
+                }, is_best=False, filename=os.path.join(args.log_dir, 'checkpoint_{:04d}.pth.tar'.format(epoch)))
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, epoch, args, scaler):
     batch_time = lib.AverageMeter('Time', ':6.3f')
     data_time = lib.AverageMeter('Data', ':6.3f')
     losses = lib.AverageMeter('Loss', ':.4f')
@@ -319,15 +330,21 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             images[1] = images[1].cuda(args.gpu, non_blocking=True)
 
         # compute output and loss
-        p1, p2, z1, z2 = model(x1=images[0], x2=images[1])
-        loss = -(criterion(p1, z2).mean() + criterion(p2, z1).mean()) * 0.5
+        with torch.cuda.amp.autocast(enabled=scaler is not None):
+            p1, p2, z1, z2 = model(x1=images[0], x2=images[1])
+            loss = -(criterion(p1, z2).mean() + criterion(p2, z1).mean()) * 0.5
 
         losses.update(loss.item(), images[0].size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)

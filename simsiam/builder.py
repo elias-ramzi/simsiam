@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import torch
 import torch.nn as nn
 
 
@@ -11,16 +12,22 @@ class SimSiam(nn.Module):
     """
     Build a SimSiam model.
     """
-    def __init__(self, base_encoder, dim=2048, pred_dim=512, dataset='imagenet'):
+    def __init__(self, base_encoder, dim=2048, pred_dim=512, dataset='imagenet', amp=False):
         """
         dim: feature dimension (default: 2048)
         pred_dim: hidden dimension of the predictor (default: 512)
         """
         super(SimSiam, self).__init__()
-
+        self.amp = amp
         # create the encoder
         # num_classes is the output fc dimension, zero-initialize last BNs
         self.encoder = base_encoder(num_classes=dim, zero_init_residual=True)
+
+        if dataset == 'cifar10':
+            assert hasattr(self.encoder, 'conv1')
+            assert hasattr(self.encoder, 'maxpool')
+            self.encoder.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            self.encoder.maxpool = nn.Identity()
 
         # build a 3-layer projector
         prev_dim = self.encoder.fc.weight.shape[1]
@@ -50,12 +57,12 @@ class SimSiam(nn.Module):
             p1, p2, z1, z2: predictors and targets of the network
             See Sec. 3 of https://arxiv.org/abs/2011.10566 for detailed notations
         """
+        with torch.cuda.amp.autocast(enabled=self.amp):
+            # compute features for one view
+            z1 = self.encoder(x1)  # NxC
+            z2 = self.encoder(x2)  # NxC
 
-        # compute features for one view
-        z1 = self.encoder(x1)  # NxC
-        z2 = self.encoder(x2)  # NxC
+            p1 = self.predictor(z1)  # NxC
+            p2 = self.predictor(z2)  # NxC
 
-        p1 = self.predictor(z1)  # NxC
-        p2 = self.predictor(z2)  # NxC
-
-        return p1, p2, z1.detach(), z2.detach()
+            return p1, p2, z1.detach(), z2.detach()

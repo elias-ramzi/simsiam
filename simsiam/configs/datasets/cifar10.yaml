@@ -1,6 +1,0 @@
-# @package _group_
-name: CIFAR10
-kwargs:
-  root: /local/DEEPLEARNING/image_retrieval/
-  train: True
-  download: False

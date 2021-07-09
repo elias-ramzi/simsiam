@@ -1,4 +1,0 @@
-# @package _group_
-base_encoder: resnet50
-dim: 2048
-pred_dim: 512
