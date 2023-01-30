@@ -167,12 +167,15 @@ def main_worker(gpu, ngpus_per_node, args):
             checkpoint = torch.load(args.pretrained, map_location="cpu")
 
             # rename moco pre-trained keys
-            state_dict = checkpoint['state_dict']
+            # state_dict = checkpoint['state_dict']
+            state_dict = checkpoint['net_state']
             for k in list(state_dict.keys()):
                 # retain only encoder up to before the embedding layer
-                if k.startswith('module.encoder') and not k.startswith('module.encoder.fc'):
+                if k.startswith('module.encoder.0.') and not k.startswith('module.encoder.0.fc'):
+                # if k.startswith('module.encoder') and not k.startswith('module.encoder.fc'):
                     # remove prefix
-                    state_dict[k[len("module.encoder."):]] = state_dict[k]
+                    # state_dict[k[len("module.encoder."):]] = state_dict[k]
+                    state_dict[k[len("module.encoder.0."):]] = state_dict[k]
                 # delete renamed or unused k
                 del state_dict[k]
 
@@ -277,7 +280,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler, persistent_workers=True)
 
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, transforms.Compose([
@@ -303,24 +306,27 @@ def main_worker(gpu, ngpus_per_node, args):
         # train for one epoch
         train(train_loader, model, criterion, optimizer, scaler, epoch, args)
 
-        # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
-
-        # remember best acc@1 and save checkpoint
-        is_best = acc1 > best_acc1
-        best_acc1 = max(acc1, best_acc1)
-
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
+
+            if epoch == args.epochs - 1:
+                # evaluate on validation set
+                acc1 = validate(val_loader, model, criterion, args)
+
+                # remember best acc@1 and save checkpoint
+                is_best = acc1 > best_acc1
+                best_acc1 = max(acc1, best_acc1)
+
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
-                'optimizer' : optimizer.state_dict(),
-            }, is_best)
-            if epoch == args.start_epoch:
-                sanity_check(model.state_dict(), args.pretrained)
+                'optimizer': optimizer.state_dict(),
+                'scaler': scaler.state_dict(),
+            }, True)
+            # if epoch == args.start_epoch:
+            #     sanity_check(model.state_dict(), args.pretrained)
 
 
 def train(train_loader, model, criterion, optimizer, scaler, epoch, args):
